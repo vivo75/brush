@@ -504,6 +504,73 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         self,
         func_registration: functions::Registration,
     ) -> Result<ExecutionSpawnResult, error::Error> {
+        match self.shell {
+            ShellForCommand::OwnedShell { target, .. } => {
+                Ok(Self::execute_via_function_in_owned_shell(
+                    *target,
+                    self.params,
+                    func_registration,
+                    self.command_name,
+                    self.args,
+                ))
+            }
+            ShellForCommand::ParentShell(..) => {
+                self.execute_via_function_in_parent_shell(func_registration)
+                    .await
+            }
+        }
+    }
+
+    // A shell function used as a non-last pipeline stage must run as a background task -- exactly
+    // like `execute_via_builtin_in_owned_shell` -- rather than being awaited inline in
+    // `spawn_pipeline_processes`'s per-stage loop. Awaiting it inline blocks that loop until the
+    // function body fully returns, so the *next* stage (the one that would drain this function's
+    // stdout pipe) is never even spawned. A function that writes more to its stdout than the OS
+    // pipe buffer holds (~64 KiB on Linux) before returning then blocks on that `write()`
+    // forever -- a hard deadlock, not slow completion. A real shell always runs every pipeline
+    // stage as its own concurrently-running process, so this never arises there.
+    fn execute_via_function_in_owned_shell(
+        mut shell: Shell<SE>,
+        params: ExecutionParameters,
+        func_registration: functions::Registration,
+        command_name: String,
+        args: Vec<CommandArg>,
+    ) -> ExecutionSpawnResult {
+        let last_arg = Self::take_last_arg(&args);
+        let join_handle = tokio::task::spawn_blocking(move || {
+            let cmd_context = ExecutionContext {
+                shell: &mut shell,
+                command_name,
+                params,
+            };
+
+            let rt = tokio::runtime::Handle::current();
+            let spawn_result = rt.block_on(invoke_shell_function(
+                func_registration,
+                cmd_context,
+                &args[1..],
+            ));
+
+            // Update $_ after command execution.
+            shell.update_last_arg_variable(last_arg);
+
+            match spawn_result? {
+                ExecutionSpawnResult::Completed(result) => Ok(result),
+                ExecutionSpawnResult::StartedProcess(_) | ExecutionSpawnResult::StartedTask(_) => {
+                    // `invoke_shell_function` only ever returns `Completed` today; this guards
+                    // against a silent behavior change rather than dropping already-started work.
+                    error::unimp("invoke_shell_function returned an unexpected spawn result")
+                }
+            }
+        });
+
+        ExecutionSpawnResult::StartedTask(join_handle)
+    }
+
+    async fn execute_via_function_in_parent_shell(
+        self,
+        func_registration: functions::Registration,
+    ) -> Result<ExecutionSpawnResult, error::Error> {
         let mut shell = self.shell;
         let last_arg = Self::take_last_arg(&self.args);
 
