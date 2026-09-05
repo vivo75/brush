@@ -1,11 +1,147 @@
 //! Defines the Abstract Syntax Tree (ast) for shell programs. Includes types and utilities
 //! for manipulating the AST.
 
+use std::cell::{Cell, RefCell};
 use std::fmt::{Display, Write};
 
 use crate::{SourceSpan, tokenizer};
 
 const DISPLAY_INDENT: &str = "    ";
+
+thread_local! {
+    /// Here-document bodies whose redirection operator has been rendered on the current line but
+    /// whose body has not yet been emitted.
+    ///
+    /// A here-document is unusual to render: `cmd <<TAG` goes on the command line (possibly
+    /// before other redirections on the same command), but the body and terminator must follow
+    /// the *end of that line*, unindented (a `<<TAG` terminator is only recognized at column 0;
+    /// `<<-TAG` additionally strips leading tabs, and the parsed body already has them removed).
+    /// This mirrors what a shell itself does when it prints a command (bash's `deferred_heredocs`
+    /// in `print_cmd.c`).
+    ///
+    /// [`IoRedirect`]'s `Display` pushes each body block here; [`flush_deferred_heredocs`] drains
+    /// them at the next line boundary. [`ShellIndent`] suppresses its indentation while a block is
+    /// being written so the body lands at column 0 regardless of nesting depth.
+    static DEFERRED_HEREDOCS: RefCell<DeferredHeredocs> = const { RefCell::new(DeferredHeredocs::new()) };
+
+    /// Nesting depth of verbatim spans (word / quoted-string / command-substitution text)
+    /// currently being written. While non-zero, [`ShellIndent`] inserts no indentation: a shell
+    /// prints words exactly as written, so re-indenting the interior lines of a multi-line word
+    /// would both diverge from bash and make `declare -f` non-idempotent -- each round-trip would
+    /// add another level of indentation inside the string.
+    static RAW_SPAN_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII guard that marks its lifetime as a verbatim span for [`RAW_SPAN_DEPTH`].
+struct RawSpan;
+
+impl RawSpan {
+    fn enter() -> Self {
+        RAW_SPAN_DEPTH.set(RAW_SPAN_DEPTH.get() + 1);
+        Self
+    }
+}
+
+impl Drop for RawSpan {
+    fn drop(&mut self) {
+        RAW_SPAN_DEPTH.set(RAW_SPAN_DEPTH.get() - 1);
+    }
+}
+
+#[derive(Default)]
+struct DeferredHeredocs {
+    /// Pending body blocks, each already terminated by a newline.
+    blocks: Vec<String>,
+    /// True while a pending block is being written out, so [`ShellIndent`] stops indenting.
+    writing: bool,
+}
+
+impl DeferredHeredocs {
+    const fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            writing: false,
+        }
+    }
+}
+
+/// Queues a here-document body block (`<body><terminator>\n`) to be emitted at the next line
+/// boundary. See [`DEFERRED_HEREDOCS`].
+fn defer_heredoc_body(block: String) {
+    DEFERRED_HEREDOCS.with_borrow_mut(|d| d.blocks.push(block));
+}
+
+/// Whether any here-document body is currently queued for the line being rendered.
+fn has_deferred_heredocs() -> bool {
+    DEFERRED_HEREDOCS.with_borrow(|d| !d.blocks.is_empty())
+}
+
+/// Emits every queued here-document body, each preceded by a newline (so the first one ends the
+/// current command's line) and written unindented. A no-op when nothing is queued.
+fn flush_deferred_heredocs(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let blocks = DEFERRED_HEREDOCS.with_borrow_mut(|d| std::mem::take(&mut d.blocks));
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    DEFERRED_HEREDOCS.with_borrow_mut(|d| d.writing = true);
+    // A single newline ends the command's line; the body blocks then run back-to-back (each is
+    // already newline-terminated), matching how a shell prints consecutive here-documents.
+    let result = write!(f, "\n{}", blocks.concat());
+    DEFERRED_HEREDOCS.with_borrow_mut(|d| d.writing = false);
+    result
+}
+
+/// A `fmt::Write` adapter that prefixes each non-empty line with [`DISPLAY_INDENT`], the way a
+/// shell indents the body of a compound command when it prints it. Equivalent to
+/// Like the block indenter this replaces (`indenter::indented(f).with_str(DISPLAY_INDENT)`),
+/// line whose starting newline was emitted inside a verbatim span -- a here-document body
+/// ([`DEFERRED_HEREDOCS`]) or the interior of a multi-line word ([`RAW_SPAN_DEPTH`]) -- is left
+/// at column 0. A shell prints those regions exactly as written; the *first* line of such a
+/// region (the one carrying the redirection operator or the opening of the word) is still
+/// indented normally.
+struct ShellIndent<'a, W: ?Sized> {
+    inner: &'a mut W,
+    at_line_start: bool,
+    /// Whether the newline that began the line now being written was emitted inside a verbatim
+    /// span. Such a line is not indented.
+    line_started_raw: bool,
+}
+
+const fn shell_indent<W: Write + ?Sized>(inner: &mut W) -> ShellIndent<'_, W> {
+    ShellIndent {
+        inner,
+        at_line_start: true,
+        line_started_raw: false,
+    }
+}
+
+fn in_verbatim_span() -> bool {
+    DEFERRED_HEREDOCS.with_borrow(|d| d.writing) || RAW_SPAN_DEPTH.get() > 0
+}
+
+impl<W: Write + ?Sized> Write for ShellIndent<'_, W> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let raw = in_verbatim_span();
+        for (i, line) in s.split('\n').enumerate() {
+            if i > 0 {
+                self.inner.write_char('\n')?;
+                self.at_line_start = true;
+                self.line_started_raw = raw;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            if self.at_line_start {
+                if !self.line_started_raw {
+                    self.inner.write_str(DISPLAY_INDENT)?;
+                }
+                self.at_line_start = false;
+            }
+            self.inner.write_str(line)?;
+        }
+        Ok(())
+    }
+}
 
 /// Trait implemented by all AST nodes. Used to aggregate traits expected
 /// to be implemented.
@@ -61,6 +197,8 @@ impl Display for Program {
         for complete_command in &self.complete_commands {
             write!(f, "{complete_command}")?;
         }
+        // Guard against a deferred here-document body leaking into a later render.
+        flush_deferred_heredocs(f)?;
         Ok(())
     }
 }
@@ -350,7 +488,9 @@ impl Display for Pipeline {
         }
         for (i, command) in self.seq.iter().enumerate() {
             if i > 0 {
-                write!(f, " |")?;
+                // Note the surrounding spaces, which a shell puts around the pipe when it
+                // prints a pipeline.
+                write!(f, " | ")?;
             }
             write!(f, "{command}")?;
         }
@@ -682,7 +822,7 @@ impl Display for CaseClauseCommand {
         // Note the trailing space, which the shell emits when printing a case clause.
         write!(f, "case {} in ", self.value)?;
         for case in &self.cases {
-            write!(indenter::indented(f).with_str(DISPLAY_INDENT), "{case}")?;
+            write!(shell_indent(f), "{case}")?;
         }
         writeln!(f)?;
         write!(f, "esac")
@@ -734,12 +874,18 @@ impl CompoundList {
             // Write the and-or list.
             write!(f, "{}", item.0)?;
 
-            // Write the separator... unless we're on the last list item and it's a ';'
-            // that the enclosing construct doesn't want.
-            if keep_trailing_separator
+            if has_deferred_heredocs() {
+                // The command opened a here-document. Its separator is replaced by the newline
+                // that ends the command's line plus the here-document body/terminator (at column
+                // 0); the next item's leading newline then supplies the blank line a shell leaves
+                // after a here-document body.
+                flush_deferred_heredocs(f)?;
+            } else if keep_trailing_separator
                 || i < self.0.len() - 1
                 || !matches!(item.1, SeparatorOperator::Sequence)
             {
+                // Write the separator... unless we're on the last list item and it's a ';'
+                // that the enclosing construct doesn't want.
                 write!(f, "{}", item.1)?;
             }
         }
@@ -821,11 +967,7 @@ impl SourceLocation for IfClauseCommand {
 impl Display for IfClauseCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "if {}; then", self.condition)?;
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.then.terminated()
-        )?;
+        write!(shell_indent(f), "{}", self.then.terminated())?;
         if let Some(elses) = &self.elses {
             for else_clause in elses {
                 write!(f, "{else_clause}")?;
@@ -866,11 +1008,7 @@ impl Display for ElseClause {
             writeln!(f, "else")?;
         }
 
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.body.terminated()
-        )
+        write!(shell_indent(f), "{}", self.body.terminated())
     }
 }
 
@@ -953,7 +1091,7 @@ impl Display for CaseItem {
         writeln!(f, ")")?;
 
         if let Some(cmd) = &self.cmd {
-            write!(indenter::indented(f).with_str(DISPLAY_INDENT), "{cmd}")?;
+            write!(shell_indent(f), "{cmd}")?;
         }
         writeln!(f)?;
         write!(f, "{}", self.post_action)
@@ -1046,6 +1184,9 @@ impl Display for FunctionDefinition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{} () ", self.fname.value)?;
         write!(f, "{}", self.body)?;
+        // Drain any here-document opened by a redirection on the function body itself
+        // (`f() { ...; } <<EOF`), and guard against a body block leaking into a later render.
+        flush_deferred_heredocs(f)?;
         Ok(())
     }
 }
@@ -1114,11 +1255,7 @@ impl SourceLocation for BraceGroupCommand {
 impl Display for BraceGroupCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{{ ")?;
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.list
-        )?;
+        write!(shell_indent(f), "{}", self.list)?;
         writeln!(f)?;
         write!(f, "}}")?;
 
@@ -1143,11 +1280,7 @@ pub struct DoGroupCommand {
 impl Display for DoGroupCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "do")?;
-        write!(
-            indenter::indented(f).with_str(DISPLAY_INDENT),
-            "{}",
-            self.list.terminated()
-        )?;
+        write!(shell_indent(f), "{}", self.list.terminated())?;
         writeln!(f)?;
         write!(f, "done")
     }
@@ -1365,7 +1498,11 @@ impl Display for CommandPrefixOrSuffixItem {
             Self::Word(word) => write!(f, "{word}"),
             Self::AssignmentWord(_assignment, word) => write!(f, "{word}"),
             Self::ProcessSubstitution(kind, subshell_command) => {
-                write!(f, "{kind}({subshell_command})")
+                // `>(list)` / `<(list)` -- the parentheses belong to the process-substitution
+                // syntax itself, so render the inner list directly rather than via
+                // `SubshellCommand`'s own `( ... )` (which would double the parens, and compound
+                // on every `declare -f` round-trip).
+                write!(f, "{kind}({})", subshell_command.list)
             }
         }
     }
@@ -1564,7 +1701,13 @@ impl Display for IoRedirect {
                     write!(f, "{fd_num}")?;
                 }
 
-                write!(f, "{kind} {target}")?;
+                // A shell prints a file-descriptor duplication (`>&1`, `<&-`) with no space
+                // between the operator and its target; every other file redirection gets one.
+                let sep = match kind {
+                    IoFileRedirectKind::DuplicateInput | IoFileRedirectKind::DuplicateOutput => "",
+                    _ => " ",
+                };
+                write!(f, "{kind}{sep}{target}")?;
             }
             Self::OutputAndError(target, append) => {
                 write!(f, "&>")?;
@@ -1578,7 +1721,18 @@ impl Display for IoRedirect {
                     write!(f, "{fd_num}")?;
                 }
 
+                // Only the operator + tag go on the command line here; the body and terminator
+                // are queued and emitted, unindented, once the line ends. See
+                // [`DEFERRED_HEREDOCS`].
                 write!(f, "<<{here_doc}")?;
+
+                let mut block = here_doc.doc.value.clone();
+                if !block.is_empty() && !block.ends_with('\n') {
+                    block.push('\n');
+                }
+                block.push_str(&here_doc.here_end.value);
+                block.push('\n');
+                defer_heredoc_body(block);
             }
             Self::HereString(fd_num, s) => {
                 if let Some(fd_num) = fd_num {
@@ -1658,7 +1812,8 @@ impl Display for IoFileRedirectTarget {
             Self::Filename(word) => write!(f, "{word}"),
             Self::Fd(fd) => write!(f, "{fd}"),
             Self::ProcessSubstitution(kind, subshell_command) => {
-                write!(f, "{kind}{subshell_command}")
+                // See the note on `CommandPrefixOrSuffixItem::ProcessSubstitution`.
+                write!(f, "{kind}({})", subshell_command.list)
             }
             Self::Duplicate(word) => write!(f, "{word}"),
         }
@@ -1701,15 +1856,14 @@ impl SourceLocation for IoHereDocument {
 }
 
 impl Display for IoHereDocument {
+    /// Renders only the here tag as it appears right after `<<` on the command line
+    /// (`-` for a tab-stripping `<<-`, then the delimiter word). The body and terminator are
+    /// emitted separately -- see [`IoRedirect`]'s `Display` and [`DEFERRED_HEREDOCS`].
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.remove_tabs {
             write!(f, "-")?;
         }
-
-        writeln!(f, "{}", self.here_end)?;
-        write!(f, "{}", self.doc)?;
-        writeln!(f, "{}", self.here_end)?;
-
+        write!(f, "{}", self.here_end)?;
         Ok(())
     }
 }
@@ -2022,6 +2176,10 @@ impl SourceLocation for Word {
 
 impl Display for Word {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A word is emitted verbatim, including any embedded newlines (multi-line quoted
+        // strings, `$( ... )` spanning lines). Mark the span so `ShellIndent` leaves its
+        // interior lines alone. See [`RAW_SPAN_DEPTH`].
+        let _raw = RawSpan::enter();
         write!(f, "{}", self.value)
     }
 }
