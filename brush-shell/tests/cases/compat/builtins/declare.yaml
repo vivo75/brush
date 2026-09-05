@@ -328,6 +328,55 @@ cases:
       }
       declare -f f
 
+  - name: "Displaying a function with a here-document"
+    stdin: |
+      f() {
+        cat <<EOF > "${dest}.c"
+      #include <stdio.h>
+      int main(void) { return 0; }
+      EOF
+        rm -f "${dest}.c"
+      }
+      g() { echo before; cat <<END; echo after; }
+      one
+      two
+      END
+      declare -f f
+      declare -f g
+
+  - name: "Displaying a function with a process substitution"
+    stdin: |
+      f() { diff <(echo a) <(sort <<<b); tee >(cat >/dev/null) < /dev/null; }
+      declare -f f
+
+  - name: "Displaying a function with a multi-line quoted string"
+    stdin: |
+      f() {
+        local code='
+      #if defined(__GNUC__)
+      HAVE_GCC
+      #endif
+      '
+        printf '%s' "${code}"
+      }
+      declare -f f
+
+  - name: "declare -f output is idempotent (multi-phase env save/restore)"
+    stdin: |
+      f() {
+        cat <<EOF
+      line one
+      line two
+      EOF
+        local s='multi
+      line
+      string'
+        tee >(cat >/dev/null) 2>&1 <<<"$s"
+      }
+      d=$(declare -f f)
+      eval "$d"
+      [ "$d" = "$(declare -f f)" ] && echo "idempotent" || { echo "NOT idempotent"; diff <(printf '%s\n' "$d") <(declare -f f); }
+
   - name: "Displaying non-existent functions"
     stdin: |
       declare -f not_a_function
