@@ -624,6 +624,64 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         state: &mut TokenParseState,
         terminating_char: char,
         nesting_open: &str,
+        nesting_count: u32,
+    ) -> Result<(), TokenizerError> {
+        // Tokenize the construct's contents with a fresh here-document
+        // context. See `suspend_outer_here_docs` for why.
+        let suspended = self.suspend_outer_here_docs();
+        let result = self.consume_nested_construct_inner(
+            state,
+            terminating_char,
+            nesting_open,
+            nesting_count,
+        );
+        self.restore_outer_here_docs(suspended);
+        result
+    }
+
+    /// Suspends any here-document whose tag has already been seen on the current line but whose
+    /// body has not yet been read, returning the suspended state for a later
+    /// [`Self::restore_outer_here_docs`].
+    ///
+    /// This is used around the tokenization of a nested `$(...)`, `${...}`, `$((...))`, or `$[...]`
+    /// construct. Without it, a sub-token emitted while scanning the construct's contents (for
+    /// example `base` in `> "${base}.c"` on a line that also carries `cat <<EOF`) is delimited
+    /// while the *outer* here tag is still mid-collection, so `delimit_current_token` misroutes it
+    /// into that tag's post-tag token list -- corrupting the enclosing word (`"${base}.c"` becomes
+    /// `base` + `"${}.c"`) and, for `cat <<${VAR}`, the here tag itself.
+    ///
+    /// A here-document opened *inside* the nested construct still works: it is tokenized against
+    /// the fresh (empty) context and is expected to be fully consumed before the construct's
+    /// terminator; `restore_outer_here_docs` merges back anything left open.
+    fn suspend_outer_here_docs(&mut self) -> (HereState, Vec<HereTag>) {
+        (
+            std::mem::take(&mut self.cross_state.here_state),
+            std::mem::take(&mut self.cross_state.current_here_tags),
+        )
+    }
+
+    /// Restores the here-document state suspended by [`Self::suspend_outer_here_docs`].
+    ///
+    /// If the nested construct left a here-document open -- bash's "unterminated here-document in
+    /// command substitution" case, where the body is read from the lines that follow the construct
+    /// -- its tag(s) are appended after the restored outer tags so both bodies are still read.
+    fn restore_outer_here_docs(&mut self, suspended: (HereState, Vec<HereTag>)) {
+        let (outer_state, outer_tags) = suspended;
+        let inner_state = std::mem::replace(&mut self.cross_state.here_state, outer_state);
+        let inner_tags = std::mem::replace(&mut self.cross_state.current_here_tags, outer_tags);
+        if !inner_tags.is_empty() {
+            self.cross_state.current_here_tags.extend(inner_tags);
+            if matches!(self.cross_state.here_state, HereState::None) {
+                self.cross_state.here_state = inner_state;
+            }
+        }
+    }
+
+    fn consume_nested_construct_inner(
+        &mut self,
+        state: &mut TokenParseState,
+        terminating_char: char,
+        nesting_open: &str,
         mut nesting_count: u32,
     ) -> Result<(), TokenizerError> {
         let mut pending_here_doc_tokens = vec![];
@@ -686,6 +744,80 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         }
 
         state.append_char(self.next_char()?.unwrap());
+        Ok(())
+    }
+
+    /// Consumes the body of a braced parameter expansion (`${...}`), up to and including the
+    /// closing `}`, appending its verbatim text to `state`. The opening `${` must already have
+    /// been consumed and appended by the caller.
+    ///
+    /// Callers wrap this in [`Self::suspend_outer_here_docs`] /
+    /// [`Self::restore_outer_here_docs`] so a sub-token of the expansion is not misrouted into an
+    /// outer here tag's post-tag token list.
+    fn consume_braced_parameter_expansion(
+        &mut self,
+        state: &mut TokenParseState,
+    ) -> Result<(), TokenizerError> {
+        let mut pending_here_doc_tokens = vec![];
+        let mut drain_here_doc_tokens = false;
+
+        loop {
+            let cur_token = if drain_here_doc_tokens && !pending_here_doc_tokens.is_empty() {
+                if pending_here_doc_tokens.len() == 1 {
+                    drain_here_doc_tokens = false;
+                }
+
+                pending_here_doc_tokens.remove(0)
+            } else {
+                let cur_token =
+                    self.next_token_until(Some('}'), false /* include space? */)?;
+
+                // See if this is a here-document-related token we need to hold
+                // onto until after we've seen all the tokens that need to show
+                // up before we get to the body.
+                if matches!(
+                    cur_token.reason,
+                    TokenEndReason::HereDocumentBodyStart
+                        | TokenEndReason::HereDocumentBodyEnd
+                        | TokenEndReason::HereDocumentEndTag
+                ) {
+                    pending_here_doc_tokens.push(cur_token);
+                    continue;
+                }
+
+                cur_token
+            };
+
+            if matches!(cur_token.reason, TokenEndReason::UnescapedNewLine)
+                && !pending_here_doc_tokens.is_empty()
+            {
+                pending_here_doc_tokens.push(cur_token);
+                drain_here_doc_tokens = true;
+                continue;
+            }
+
+            if let Some(cur_token_value) = cur_token.token {
+                state.append_str(cur_token_value.to_str());
+            }
+
+            match cur_token.reason {
+                TokenEndReason::HereDocumentBodyStart => {
+                    state.append_char('\n');
+                }
+                TokenEndReason::NonNewLineBlank => state.append_char(' '),
+                TokenEndReason::SpecifiedTerminatingChar => {
+                    // We hit the end brace we were looking for but did not
+                    // yet consume it. Do so now.
+                    state.append_char(self.next_char()?.unwrap());
+                    break;
+                }
+                TokenEndReason::EndOfInput => {
+                    return Err(TokenizerError::UnterminatedVariable);
+                }
+                _ => (),
+            }
+        }
+
         Ok(())
     }
 
@@ -975,69 +1107,12 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                             // Consume the '{' and add it to the token.
                             state.append_char(self.next_char()?.unwrap());
 
-                            let mut pending_here_doc_tokens = vec![];
-                            let mut drain_here_doc_tokens = false;
-
-                            loop {
-                                let cur_token = if drain_here_doc_tokens
-                                    && !pending_here_doc_tokens.is_empty()
-                                {
-                                    if pending_here_doc_tokens.len() == 1 {
-                                        drain_here_doc_tokens = false;
-                                    }
-
-                                    pending_here_doc_tokens.remove(0)
-                                } else {
-                                    let cur_token = self.next_token_until(
-                                        Some('}'),
-                                        false, /* include space? */
-                                    )?;
-
-                                    // See if this is a here-document-related token we need to hold
-                                    // onto until after we've seen all the tokens that need to show
-                                    // up before we get to the body.
-                                    if matches!(
-                                        cur_token.reason,
-                                        TokenEndReason::HereDocumentBodyStart
-                                            | TokenEndReason::HereDocumentBodyEnd
-                                            | TokenEndReason::HereDocumentEndTag
-                                    ) {
-                                        pending_here_doc_tokens.push(cur_token);
-                                        continue;
-                                    }
-
-                                    cur_token
-                                };
-
-                                if matches!(cur_token.reason, TokenEndReason::UnescapedNewLine)
-                                    && !pending_here_doc_tokens.is_empty()
-                                {
-                                    pending_here_doc_tokens.push(cur_token);
-                                    drain_here_doc_tokens = true;
-                                    continue;
-                                }
-
-                                if let Some(cur_token_value) = cur_token.token {
-                                    state.append_str(cur_token_value.to_str());
-                                }
-
-                                match cur_token.reason {
-                                    TokenEndReason::HereDocumentBodyStart => {
-                                        state.append_char('\n');
-                                    }
-                                    TokenEndReason::NonNewLineBlank => state.append_char(' '),
-                                    TokenEndReason::SpecifiedTerminatingChar => {
-                                        // We hit the end brace we were looking for but did not
-                                        // yet consume it. Do so now.
-                                        state.append_char(self.next_char()?.unwrap());
-                                        break;
-                                    }
-                                    TokenEndReason::EndOfInput => {
-                                        return Err(TokenizerError::UnterminatedVariable);
-                                    }
-                                    _ => (),
-                                }
-                            }
+                            // Tokenize the expansion's body with a fresh here-document context.
+                            // See `suspend_outer_here_docs`.
+                            let suspended = self.suspend_outer_here_docs();
+                            let result = self.consume_braced_parameter_expansion(&mut state);
+                            self.restore_outer_here_docs(suspended);
+                            result?;
                         }
                         _ => {
                             // This is either a different character, or else the end of the string.
@@ -1525,6 +1600,39 @@ HERE1
 OTHER
 HERE2
 echo after
+"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_here_doc_line_with_nested_constructs_in_a_later_redirect() -> Result<()> {
+        // Regression: a `${...}`, `$(...)`, or `$((...))` on the same line as a here tag, in a
+        // redirection target that follows the tag, must be tokenized as a single word -- its
+        // sub-tokens must not be captured by the pending here-document.
+        assert_ron_snapshot!(test_tokenizer(
+            r#"cat <<EOF > "${base}.c"
+body
+EOF
+"#
+        )?);
+        assert_ron_snapshot!(test_tokenizer(
+            r#"cat <<EOF > "out$((1 + 2)).c" 2>&1
+body
+EOF
+"#
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_here_tag_that_is_a_braced_parameter_expansion() -> Result<()> {
+        // Regression: the delimiter word of `<<${VAR}` is the literal string `${VAR}`; the
+        // braces must not be stripped while scanning it.
+        assert_ron_snapshot!(test_tokenizer(
+            r"cat <<${VAR}
+body
+${VAR}
 "
         )?);
         Ok(())
