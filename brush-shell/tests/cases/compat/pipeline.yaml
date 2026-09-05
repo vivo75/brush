@@ -58,3 +58,20 @@ cases:
     stdin: |
       printf '%s\n' {0..10000} | x=1
       echo "Last: $?, PIPESTATUS: ${PIPESTATUS[*]}"
+
+  - name: "Function stage writing more than a pipe buffer before the next stage is spawned"
+    # Regression: a shell function used as a non-last pipeline stage must run
+    # concurrently with the rest of the pipeline, not be awaited to completion
+    # before the next stage is even spawned. Otherwise, once the function writes
+    # more to its stdout pipe than the OS pipe buffer holds (commonly 64 KiB on
+    # Linux) before returning, that write() blocks forever -- nothing is reading
+    # the other end yet. A real shell always runs every stage as its own process.
+    stdin: |
+      big() {
+        local i
+        for i in $(seq 1 5000); do
+          echo "padding line number ${i} to exceed the pipe buffer size"
+        done
+      }
+      big | wc -l
+      echo "Last: $?, PIPESTATUS: ${PIPESTATUS[*]}"
