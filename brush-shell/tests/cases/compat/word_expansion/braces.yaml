@@ -328,3 +328,18 @@ cases:
       printf '[%s]\n' x{1,2}
       arr=({a,b}c)
       echo "${#arr[@]}"
+
+  - name: "Expansion with curly braces does not depend on IFS"
+    stdin: |
+      IFS=
+      printf '<%s>' {A..C}
+      echo
+      printf '<%s>' {1,2}
+      echo
+      printf '<%s>' {a,}
+      echo
+      IFS=:
+      printf '<%s>' {A..C}
+      echo
+      printf '<%s>' x{1..3}y
+      echo

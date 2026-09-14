@@ -2411,6 +2411,37 @@ mod tests {
         Ok(())
     }
 
+    /// Brace expansion produces fields on its own; it must not depend on
+    /// field splitting (i.e. IFS) to separate its alternatives. `IFS=` and
+    /// `IFS=:` used to collapse `{A..C}` into a single space-joined word,
+    /// which real `bin/phase-functions.sh`'s `__filter_readonly_variables`
+    /// trips over: it builds its special-variable list with
+    /// `printf '${!%s*} ' {A..Z} {a..z} _` inside a function that has already
+    /// run `local IFS`.
+    #[tokio::test]
+    async fn test_brace_expansion_does_not_depend_on_ifs() -> Result<()> {
+        for ifs in ["", ":"] {
+            let mut shell = crate::shell::Shell::builder().build().await?;
+            shell
+                .env_mut()
+                .set_global("IFS", crate::variables::ShellVariable::new(ifs))?;
+            let params = shell.default_exec_params();
+
+            assert_eq!(
+                full_expand_and_split_word(&mut shell, &params, "{A..C}").await?,
+                vec!["A", "B", "C"],
+                "IFS={ifs:?}"
+            );
+            assert_eq!(
+                full_expand_and_split_word(&mut shell, &params, "{a,}").await?,
+                vec!["a"],
+                "IFS={ifs:?}"
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_to_initial_capitals() {
         assert_eq!(to_initial_capitals("ab bc cd"), String::from("Ab Bc Cd"));
