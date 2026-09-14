@@ -187,3 +187,18 @@ cases:
     stdin: |
       echo {-9223372036854775808..-9223372036854775806}
       echo {9223372036854775805..9223372036854775807}
+
+  - name: "Expansion with curly braces does not depend on IFS"
+    stdin: |
+      IFS=
+      printf '<%s>' {A..C}
+      echo
+      printf '<%s>' {1,2}
+      echo
+      printf '<%s>' {a,}
+      echo
+      IFS=:
+      printf '<%s>' {A..C}
+      echo
+      printf '<%s>' x{1..3}y
+      echo

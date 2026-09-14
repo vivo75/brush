@@ -791,22 +791,53 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
 
         // Apply brace expansion first, before anything else (not applicable to heredoc bodies).
-        let brace_expanded = self.brace_expand_if_needed(word)?;
-        if tracing::enabled!(target: trace_categories::EXPANSION, tracing::Level::DEBUG)
-            && brace_expanded != word
-        {
-            tracing::debug!(target: trace_categories::EXPANSION, "  => brace expanded to '{brace_expanded}'");
+        // It may yield several words (`{a,b}` -> `a` `b`); each is expanded on its own
+        // afterward and contributes its own field(s). Brace expansion creates fields
+        // directly -- unlike parameter expansion, it is not subject to IFS field
+        // splitting -- so the alternatives must never be re-joined into one word that
+        // later splitting is expected to separate again (that only works while IFS
+        // contains spaces; `IFS=`/`IFS=:` broke it).
+        if let Some(alternatives) = self.brace_expand_if_needed(word)? {
+            if tracing::enabled!(target: trace_categories::EXPANSION, tracing::Level::DEBUG) {
+                tracing::debug!(target: trace_categories::EXPANSION, "  => brace expanded to '{alternatives:?}'");
+            }
+
+            let mut result: Option<Expansion> = None;
+            for alternative in alternatives {
+                // An empty alternative (`{a,}`) yields no field at all, matching the
+                // empty, unquoted word bash drops; `{a,""}` keeps its quoted empty.
+                let expansion = self.expand_one_word(&alternative).await?;
+
+                match &mut result {
+                    Some(acc) => {
+                        acc.fields.extend(expansion.fields);
+                        acc.concatenate = expansion.concatenate;
+                        acc.kind = expansion.kind;
+                    }
+                    None => result = Some(expansion),
+                }
+            }
+
+            return Ok(result.unwrap_or_default());
         }
 
+        self.expand_one_word(word).await
+    }
+
+    /// Expand one already-brace-expanded word: tildes, parameters, command
+    /// substitutions, arithmetic; the resulting pieces are coalesced into the
+    /// word's field(s). Kept separate from [`Self::basic_expand`] so each
+    /// brace-expansion alternative can be expanded independently.
+    async fn expand_one_word(&mut self, word: &str) -> Result<Expansion, error::Error> {
         // Expand: tildes, parameters, command substitutions, arithmetic.
         let pieces = if self.heredoc_mode {
             // Heredoc mode only affects top-level parsing (literal quotes); recursive
             // expansion of parameter words (e.g., ${var:-"default"}) uses normal semantics.
             self.heredoc_mode = false;
 
-            brush_parser::word::parse_heredoc(brace_expanded.as_ref(), &self.parser_options)?
+            brush_parser::word::parse_heredoc(word, &self.parser_options)?
         } else {
-            brush_parser::word::parse(brace_expanded.as_ref(), &self.parser_options)?
+            brush_parser::word::parse(word, &self.parser_options)?
         };
 
         let mut expansions = Vec::with_capacity(pieces.len());
@@ -815,9 +846,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
             expansions.push(piece_expansion);
         }
 
-        let coalesced = coalesce_expansions(expansions);
-
-        Ok(coalesced)
+        Ok(coalesce_expansions(expansions))
     }
 
     /// Expand a word used inside a parameter expansion (like the word in ${param:+word}).
@@ -855,35 +884,47 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         }
     }
 
-    fn brace_expand_if_needed(&self, word: &'a str) -> Result<Cow<'a, str>, error::Error> {
+    /// Expand any brace expressions in `word`, returning the resulting words.
+    ///
+    /// `None` when the word needed no brace expansion; otherwise the fully
+    /// combined alternatives, in order, as separate words. The alternatives
+    /// are *fields*: they are deliberately not joined back into one string
+    /// here -- see the call site in [`Self::basic_expand`].
+    fn brace_expand_if_needed(&self, word: &str) -> Result<Option<Vec<String>>, error::Error> {
         // We perform a non-authoritative check to see if the string *may* contain braces
         // to expand. There may be false positives, but must be no false negatives.
         if self.disable_brace_expansion
             || !self.shell.options().perform_brace_expansion
             || !may_contain_braces_to_expand(word)
         {
-            return Ok(word.into());
+            return Ok(None);
         }
 
         let parse_result = brush_parser::word::parse_brace_expansions(word, &self.parser_options);
         if parse_result.is_err() {
             tracing::error!("failed to parse for brace expansion: {parse_result:?}");
-            return Ok(word.into());
+            return Ok(None);
         }
 
-        let brace_expansion_pieces = parse_result?;
-        let Some(brace_expansion_pieces) = brace_expansion_pieces else {
-            return Ok(word.into());
+        let Some(brace_expansion_pieces) = parse_result? else {
+            return Ok(None);
         };
 
         tracing::debug!(target: trace_categories::EXPANSION, "Brace expansion pieces: {brace_expansion_pieces:?}");
 
-        let result = braceexpansion::generate_and_combine_brace_expansions(brace_expansion_pieces)
-            .into_iter()
-            .map(|s| if s.is_empty() { "\"\"".into() } else { s })
-            .join(" ");
+        let alternatives: Vec<String> =
+            braceexpansion::generate_and_combine_brace_expansions(brace_expansion_pieces)
+                .into_iter()
+                .collect();
 
-        Ok(result.into())
+        // A parse can succeed without the word changing (e.g. quoted braces, or a
+        // `{...}` form that needs no expansion); report "nothing to do" so callers
+        // keep the word as-is.
+        if alternatives.len() == 1 && alternatives[0] == word {
+            return Ok(None);
+        }
+
+        Ok(Some(alternatives))
     }
 
     /// Apply tilde-expansion, parameter expansion, command substitution, and arithmetic expansion;
@@ -2355,14 +2396,57 @@ mod tests {
         let params = shell.default_exec_params();
         let expander = WordExpander::new(&mut shell, &params);
 
-        assert_eq!(expander.brace_expand_if_needed("abc")?, "abc");
-        assert_eq!(expander.brace_expand_if_needed("a{,b}d")?, "ad abd");
-        assert_eq!(expander.brace_expand_if_needed("a{b,c}d")?, "abd acd");
-        assert_eq!(expander.brace_expand_if_needed("a{1..3}d")?, "a1d a2d a3d");
-        assert_eq!(expander.brace_expand_if_needed(r#""{a,b}""#)?, r#""{a,b}""#);
-        assert_eq!(expander.brace_expand_if_needed("a{}b")?, "a{}b");
-        assert_eq!(expander.brace_expand_if_needed("a{ }b")?, "a{ }b");
-        assert_eq!(expander.brace_expand_if_needed("{a,b{1,2}}")?, "a b1 b2");
+        assert_eq!(expander.brace_expand_if_needed("abc")?, None);
+        assert_eq!(
+            expander.brace_expand_if_needed("a{,b}d")?,
+            Some(vec!["ad".to_owned(), "abd".to_owned()])
+        );
+        assert_eq!(
+            expander.brace_expand_if_needed("a{b,c}d")?,
+            Some(vec!["abd".to_owned(), "acd".to_owned()])
+        );
+        assert_eq!(
+            expander.brace_expand_if_needed("a{1..3}d")?,
+            Some(vec!["a1d".to_owned(), "a2d".to_owned(), "a3d".to_owned()])
+        );
+        assert_eq!(expander.brace_expand_if_needed(r#""{a,b}""#)?, None);
+        assert_eq!(expander.brace_expand_if_needed("a{}b")?, None);
+        assert_eq!(expander.brace_expand_if_needed("a{ }b")?, None);
+        assert_eq!(
+            expander.brace_expand_if_needed("{a,b{1,2}}")?,
+            Some(vec!["a".to_owned(), "b1".to_owned(), "b2".to_owned()])
+        );
+
+        Ok(())
+    }
+
+    /// Brace expansion produces fields on its own; it must not depend on
+    /// field splitting (i.e. IFS) to separate its alternatives. `IFS=` and
+    /// `IFS=:` used to collapse `{A..C}` into a single space-joined word,
+    /// which real `bin/phase-functions.sh`'s `__filter_readonly_variables`
+    /// trips over: it builds its special-variable list with
+    /// `printf '${!%s*} ' {A..Z} {a..z} _` inside a function that has already
+    /// run `local IFS`.
+    #[tokio::test]
+    async fn test_brace_expansion_does_not_depend_on_ifs() -> Result<()> {
+        for ifs in ["", ":"] {
+            let mut shell = crate::shell::Shell::builder().build().await?;
+            shell
+                .env_mut()
+                .set_global("IFS", crate::variables::ShellVariable::new(ifs))?;
+            let params = shell.default_exec_params();
+
+            assert_eq!(
+                full_expand_and_split_word(&mut shell, &params, "{A..C}").await?,
+                vec!["A", "B", "C"],
+                "IFS={ifs:?}"
+            );
+            assert_eq!(
+                full_expand_and_split_word(&mut shell, &params, "{a,}").await?,
+                vec!["a"],
+                "IFS={ifs:?}"
+            );
+        }
 
         Ok(())
     }
