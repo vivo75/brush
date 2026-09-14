@@ -144,9 +144,21 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         self.call_stack
             .push_script(call_type, source_info, script_positional_args);
 
-        let result = self
+        let parse_failed = parse_result.is_err();
+        let mut result = self
             .run_parsed_result(parse_result, source_info, params)
             .await;
+
+        // A parse error in a sourced file is not fatal to the *calling* shell: bash's
+        // `source`/`.` returns 2 and execution continues (so a `source f || die` guard fires,
+        // and `set -e` still sees the status), where a parse error in a script run on the
+        // command line does terminate the shell. `run_parsed_result` marks every parse error
+        // fatal, so clear the requested shell exit at the `source` boundary.
+        if parse_failed && matches!(call_type, callstack::ScriptCallType::Source) {
+            if let Ok(result) = &mut result {
+                result.next_control_flow = ExecutionControlFlow::Normal;
+            }
+        }
 
         self.call_stack.pop();
 
