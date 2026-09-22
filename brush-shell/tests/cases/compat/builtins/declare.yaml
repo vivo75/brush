@@ -675,20 +675,17 @@ cases:
       declare -p -n 2>/dev/null | sort
 
   - name: "Single-quoted scalar assignment"
-    known_failure: true # TODO: declare improvements required
     stdin: |
       declare 'x=hello'
       echo "$x"
 
   - name: "Single-quoted scalar with dollar sign preserved"
-    known_failure: true # TODO: declare improvements required
     stdin: |
       Y=world
       declare 'x=$Y'
       echo "$x"
 
   - name: "Double-quoted scalar assignment expands"
-    known_failure: true # TODO: declare improvements required
     stdin: |
       Y=world
       declare "x=$Y"
@@ -928,7 +925,6 @@ cases:
       declare -p map
 
   - name: "Single-quoted append assignment"
-    known_failure: true # TODO: declare improvements required
     stdin: |
       declare 'text=one'
       declare 'text+=two' 2>/dev/null
@@ -988,7 +984,6 @@ cases:
       f
 
   - name: "Function shadowing declare is reached through command"
-    known_failure: true # TODO: declare improvements required
     stdin: |
       declare() { echo "shadow declare: [$*]"; }
       command declare cx=1
@@ -1070,7 +1065,6 @@ cases:
   # like a subscript.
   #
   - name: "Assignment value ending in a bracket is not a subscripted name"
-    known_failure: true # TODO: declare improvements required
     stdin: |
       v='[a]'
       declare "x=$v"

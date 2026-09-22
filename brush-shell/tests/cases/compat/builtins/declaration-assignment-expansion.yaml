@@ -1,0 +1,81 @@
+name: "Builtins: declaration assignment expansion"
+cases:
+  - name: "Export assigns through an expanded name"
+    stdin: |
+      export LIT_CTL=lit
+      var=CC
+      prog=( gcc )
+      export ${var}="${prog[*]}"
+      echo "CC=[${CC}]"
+      export "${var}=quoted"
+      echo "CC=[${CC}]"
+      eqname=EQ
+      export ${eqname}=a=b
+      echo "EQ=[${EQ}]"
+      export Q="${var} and more"
+      echo "Q=[${Q}]"
+      echo "LIT_CTL=[${LIT_CTL}]"
+
+  - name: "Export appends through an expanded name"
+    stdin: |
+      MYVAR="-O3 -pipe"
+      app=MYVAR
+      export ${app}+=" -Wno-foo"
+      echo "MYVAR: $MYVAR"
+      unset NEWAPP
+      new=NEWAPP
+      export ${new}+=first
+      echo "NEWAPP: $NEWAPP"
+
+  - name: "Export with an expanded name but no value just marks exported"
+    stdin: |
+      MARKME=marked
+      mk=MARKME
+      export ${mk}
+      declare -p MARKME
+
+  - name: "Export rejects an expanded invalid name"
+    ignore_stderr: true
+    stdin: |
+      var="foo-bar"
+      export ${var}=v
+      echo "status: $?"
+      echo "CC=[${CC-unset}]"
+
+  - name: "Declare assigns through an expanded name"
+    stdin: |
+      dvar=DL
+      declare ${dvar}=world
+      echo "DL=[$DL]"
+      declare -p DL
+
+  - name: "Local assigns through an expanded name and scopes like bash"
+    stdin: |
+      myfunc() {
+        var=LF
+        local ${var}=hi
+        echo "in: LF=[$LF]"
+      }
+      myfunc
+      echo "out: LF=[${LF-unset}]"
+      myfunc2() {
+        d=DF
+        declare ${d}=inner
+        echo "in: DF=[$DF]"
+      }
+      DF=global
+      myfunc2
+      echo "out: DF=[$DF]"
+
+  - name: "Readonly assigns through an expanded name"
+    stdin: |
+      rvar=RO
+      readonly ${rvar}=ro-val
+      echo "RO=[$RO]"
+      declare -p RO
+
+  - name: "Typeset assigns through an expanded name"
+    stdin: |
+      tvar=TS
+      typeset ${tvar}=ts-val
+      echo "TS=[$TS]"
