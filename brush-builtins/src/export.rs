@@ -94,6 +94,18 @@ impl ExportCommand {
                         variable.export();
                     }
                 }
+                // The parser only recognises an assignment word with a literal name,
+                // so `export ${var}=value` arrives here as a plain string. bash
+                // assigns after expansion for declaration builtins: split on the
+                // first `=` and handle it as an assignment.
+                else if let Some(expanded) = crate::declaration::split_expanded_assignment(s) {
+                    if !brush_core::env::valid_variable_name(expanded.name.as_str()) {
+                        writeln!(context.stderr(), "export: `{s}': not a valid identifier")?;
+                        return Ok(ExecutionResult::general_error());
+                    }
+                    let assignment = expanded.into_command_arg();
+                    return self.process_decl(context, &assignment);
+                }
             }
             brush_core::CommandArg::Assignment(assignment) => {
                 let name = match &assignment.name {

@@ -35,6 +35,8 @@ mod command;
 mod complete;
 #[cfg(feature = "builtin.continue")]
 mod continue_;
+#[cfg(any(feature = "builtin.declare", feature = "builtin.export"))]
+mod declaration;
 #[cfg(feature = "builtin.declare")]
 mod declare;
 #[cfg(feature = "builtin.dirs")]
