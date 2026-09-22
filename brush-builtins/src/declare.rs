@@ -435,6 +435,23 @@ impl DeclareCommand {
                 static ARRAY_AND_INDEX_RE: LazyLock<fancy_regex::Regex> =
                     LazyLock::new(|| fancy_regex::Regex::new(r"^(.*?)\[(.*?)\]$").unwrap());
 
+                // The parser only recognises an assignment word with a literal name,
+                // so `declare ${var}=value` arrives here as a plain string. bash
+                // assigns after expansion for declaration builtins: split on the
+                // first `=` and treat a valid name as an assignment. An invalid
+                // name falls through below, where the existing validity check
+                // reports it instead of silently ignoring it.
+                if let Some(expanded) = crate::declaration::split_expanded_assignment(s) {
+                    if brush_core::env::valid_variable_name(expanded.name.as_str()) {
+                        name = expanded.name;
+                        assigned_index = None;
+                        initial_value = Some(ShellValueLiteral::Scalar(expanded.value));
+                        name_is_array = false;
+                        append = expanded.append;
+                        return Ok((name, assigned_index, initial_value, name_is_array, append));
+                    }
+                }
+
                 if let Some(captures) = ARRAY_AND_INDEX_RE.captures(s)? {
                     name = captures
                         .get(1)
