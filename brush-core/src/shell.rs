@@ -61,6 +61,18 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip, default = "default_error_formatter"))]
     error_formatter: SE::ErrorFormatter,
 
+    /// Injected process launcher.
+    #[cfg_attr(feature = "serde", serde(skip, default = "default_process_launcher"))]
+    process_launcher: SE::ProcessLauncher,
+
+    /// Injected task spawner.
+    #[cfg_attr(feature = "serde", serde(skip, default = "default_task_spawner"))]
+    task_spawner: SE::TaskSpawner,
+
+    /// The builtins' state; see [`crate::ExecutionContext::state_mut`].
+    #[cfg_attr(feature = "serde", serde(skip, default))]
+    builtin_states: builtins::BuiltinStates,
+
     /// Trap handler configuration for the shell.
     traps: crate::traps::TrapHandlerConfig,
 
@@ -101,6 +113,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Clone depth from the original ancestor shell.
     depth: usize,
 
+    /// The number the `\#` prompt escape shows: 1, plus one for each command the
+    /// interactive loop has run.
+    command_number: usize,
+
     /// Shell name
     name: Option<String>,
 
@@ -119,12 +135,12 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Directory stack used by pushd et al.
     directory_stack: Vec<PathBuf>,
 
-    /// Completion configuration.
-    completion_config: crate::completion::Config,
+    /// Programmable completion state.
+    completion: crate::completion::State,
 
     /// Shell built-in commands.
     #[cfg_attr(feature = "serde", serde(skip))]
-    builtins: HashMap<String, builtins::Registration<SE>>,
+    builtins: builtins::Registry<SE>,
 
     /// Shell program location cache.
     program_location_cache: pathcache::PathCache,
@@ -151,6 +167,9 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
     fn clone(&self) -> Self {
         Self {
             error_formatter: self.error_formatter.clone(),
+            process_launcher: self.process_launcher.clone(),
+            task_spawner: self.task_spawner.clone(),
+            builtin_states: self.builtin_states.clone(),
             traps: self.traps.clone(),
             open_files: self.open_files.clone(),
             working_dir: self.working_dir.clone(),
@@ -175,7 +194,10 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
                 cs
             },
             directory_stack: self.directory_stack.clone(),
-            completion_config: self.completion_config.clone(),
+            // A subshell of a completion function (e.g. `$(compgen ...)`) is in that
+            // completion too. Like a forked subshell in bash, it changes only its own copy
+            // (e.g. with `compopt`), which its parent doesn't see.
+            completion: self.completion.clone(),
             builtins: self.builtins.clone(),
             program_location_cache: self.program_location_cache.clone(),
             last_stopwatch_time: self.last_stopwatch_time,
@@ -184,6 +206,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             key_bindings: self.key_bindings.clone(),
             history: self.history.clone(),
             depth: self.depth + 1,
+            command_number: self.command_number,
         }
     }
 }
@@ -214,6 +237,9 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         // Instantiate the shell with some defaults.
         let mut shell = Self {
             error_formatter: options.error_formatter,
+            process_launcher: options.process_launcher,
+            task_spawner: options.task_spawner,
+            builtin_states: builtins::BuiltinStates::default(),
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
             name: options.shell_name,
@@ -261,13 +287,18 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Increments the interactive line offset in the shell by the indicated number
-    /// of lines.
+    /// of lines. The interactive loop calls this once after each command it runs, so
+    /// it also advances the command number that the `\#` prompt escape shows.
     ///
     /// # Arguments
     ///
     /// * `delta` - The number of lines to increment the current line offset by.
     pub fn increment_interactive_line_offset(&mut self, delta: usize) {
         self.call_stack.increment_current_line_offset(delta);
+        // shortcut: counts every line the loop runs, which bash doesn't for blank, comment-only
+        // or unparsable ones or for a bound key; count where the reader loop parses, once it's
+        // in core.
+        self.command_number += 1;
     }
 
     /// Updates the currently executing command in the shell.
@@ -354,13 +385,20 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         }
     }
 
-    /// Returns the keywords that are reserved by the shell.
-    pub(crate) fn get_keywords(&self) -> impl IntoIterator<Item = &str> {
-        if self.options.sh_mode {
-            keywords::SH_MODE_KEYWORDS.iter().copied()
-        } else {
-            keywords::KEYWORDS.iter().copied()
-        }
+    /// Returns the keywords that are reserved by the shell, in the order bash lists them.
+    pub(crate) fn get_keywords(&self) -> impl IntoIterator<Item = &'static str> {
+        keywords::keywords(self.options.sh_mode)
+    }
+
+    /// Returns the launcher that starts the processes the shell runs.
+    pub const fn process_launcher(&self) -> &SE::ProcessLauncher {
+        &self.process_launcher
+    }
+
+    /// Returns the spawner that starts the tasks the shell runs concurrently with
+    /// itself.
+    pub const fn task_spawner(&self) -> &SE::TaskSpawner {
+        &self.task_spawner
     }
 
     /// Checks if the given string is a keyword reserved in this shell.
@@ -369,15 +407,15 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     ///
     /// * `s` - The string to check.
     pub fn is_keyword(&self, s: &str) -> bool {
-        if self.options.sh_mode {
-            keywords::SH_MODE_KEYWORDS.contains(s)
-        } else {
-            keywords::KEYWORDS.contains(s)
-        }
+        keywords::keywords(self.options.sh_mode).any(|keyword| keyword == s)
     }
 
     pub(crate) const fn last_exit_status_change_count(&self) -> usize {
         self.last_exit_status_change_count
+    }
+
+    pub(crate) const fn command_number(&self) -> usize {
+        self.command_number
     }
 }
 
@@ -493,12 +531,12 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 
     /// Returns the shell's completion configuration.
     pub fn completion_config(&self) -> &crate::completion::Config {
-        &self.completion_config
+        &self.completion.config
     }
 
     /// Returns a mutable reference to the shell's completion configuration.
     pub fn completion_config_mut(&mut self) -> &mut crate::completion::Config {
-        &mut self.completion_config
+        &mut self.completion.config
     }
 
     /// Returns the shell's open files.
@@ -592,6 +630,16 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 #[cfg(feature = "serde")]
 fn default_error_formatter<EF: extensions::ErrorFormatter>() -> EF {
     EF::default()
+}
+
+#[cfg(feature = "serde")]
+fn default_process_launcher<PL: extensions::ProcessLauncher>() -> PL {
+    PL::default()
+}
+
+#[cfg(feature = "serde")]
+fn default_task_spawner<TS: extensions::TaskSpawner>() -> TS {
+    TS::default()
 }
 
 #[cfg(test)]

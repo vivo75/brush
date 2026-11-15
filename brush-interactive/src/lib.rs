@@ -25,24 +25,30 @@ mod trace_categories;
 
 #[cfg(feature = "highlighting")]
 pub mod highlighting;
+#[cfg(feature = "highlighting")]
+#[allow(
+    dead_code,
+    reason = "highlighting can be enabled without an input backend"
+)]
+mod styles;
 
 #[cfg(feature = "completion")]
 mod completion;
 
 // Reedline-based shell
-#[cfg(feature = "reedline")]
+#[cfg(reedline_backend)]
 mod reedline;
-#[cfg(feature = "reedline")]
+#[cfg(reedline_backend)]
 pub use reedline::ReedlineInputBackend;
-
-// Basic shell
-#[cfg(feature = "basic")]
-mod basic;
-#[cfg(feature = "basic")]
-pub use basic::BasicInputBackend;
 
 // Minimal shell
 #[cfg(feature = "minimal")]
 mod minimal;
 #[cfg(feature = "minimal")]
 pub use minimal::MinimalInputBackend;
+
+// Line editing over plain bytes
+#[cfg(feature = "vt")]
+pub mod vt;
+#[cfg(feature = "vt")]
+pub use vt::VtInputBackend;

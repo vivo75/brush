@@ -2,12 +2,16 @@
 //!
 //! The parser only recognises an assignment word when the name is a
 //! **literal** identifier (`brush-parser/src/word.rs`, `assigned_scalar_name`),
-//! so `export ${var}=value` arrives at the builtin as a
+//! so `declare ${var}=value` arrives at the builtin as a
 //! [`brush_core::CommandArg::String`]. bash performs the assignment
 //! **after** expansion for declaration builtins (`export` / `declare` /
-//! `local` / `readonly` / `typeset`; POSIX XCU 2.9.1), so the builtins
-//! re-examine an expanded string operand here: split on the first `=`
+//! `local` / `readonly` / `typeset`; POSIX XCU 2.9.1), so the builtin
+//! re-examines an expanded string operand here: split on the first `=`
 //! and treat the left side as the name.
+//!
+//! `export`'s half is upstream since [#1564](https://github.com/reubeno/brush/pull/1564);
+//! this module carries the `declare`/`local`/`readonly`/`typeset` half only,
+//! because upstream's fix stops at `export`.
 //!
 //! This is the small, builtin-local half of the choice the thin-fork fix
 //! records: upstream [#1280](https://github.com/reubeno/brush/pull/1280)
@@ -25,23 +29,6 @@ pub(crate) struct ExpandedAssignment {
     pub(crate) append: bool,
     /// Text after the first `=`, already expanded; used verbatim.
     pub(crate) value: String,
-}
-
-impl ExpandedAssignment {
-    /// Re-wrap as the assignment the parser would have produced for a
-    /// literal name, so the builtin's existing `CommandArg::Assignment`
-    /// path handles it. The value is already expanded and must not be
-    /// expanded again: a literal [`brush_parser::ast::Word`] flattens back
-    /// to itself.
-    #[cfg(feature = "builtin.export")]
-    pub(crate) fn into_command_arg(self) -> brush_core::CommandArg {
-        brush_core::CommandArg::Assignment(brush_core::parser::ast::Assignment {
-            name: brush_core::parser::ast::AssignmentName::VariableName(self.name),
-            value: brush_core::parser::ast::AssignmentValue::Scalar(self.value.into()),
-            append: self.append,
-            loc: brush_core::SourceSpan::default(),
-        })
-    }
 }
 
 /// Split an expanded declaration operand on the first `=`.

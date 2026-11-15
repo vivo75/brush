@@ -30,7 +30,7 @@ concurrency:
 jobs:
   hooks:
     name: "Pre-commit hooks"
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -42,10 +42,10 @@ jobs:
         run: rustup toolchain install --profile minimal
 
       - name: Enable cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install prek
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: prek
 
@@ -55,6 +55,12 @@ jobs:
           path: ~/.cache/prek
           key: prek-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
           restore-keys: prek-${{ runner.os }}-
+
+      - name: Prepare hooks
+        run: prek prepare-hooks
+        env:
+          # Pass through the token in case 'cargo binstall' needs it
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run pre-commit hooks
         run: cargo xtask check hooks

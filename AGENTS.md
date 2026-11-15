@@ -2,17 +2,27 @@
 
 This guide helps AI agents work efficiently on the `brush` codebase by providing essential context about architecture, patterns, and development workflows.
 
+## Required: Independent Implementation
+
+Before investigating or implementing a change, read and follow the
+[independent-implementation and provenance policy](CONTRIBUTING.md#independent-implementation-and-provenance).
+It is the canonical policy for contributors and all agents, including delegated
+agents and their tools. Use Bash as a black-box behavioral oracle, not as
+implementation source material. If you encounter Bash implementation material,
+stop implementation and disclose the exposure; do not translate, summarize, or
+rewrite it into brush. Disclose this to the human contributor to clarify how
+to proceed.
+
 ## 1. Architecture Overview & Navigation
 
-### Project Structure
+### Architecture
 
-The brush project is organized into several key crates:
-
-- **`brush-core/`**: Core shell functionality, builtins, and runtime
-- **`brush-parser/`**: Shell script parsing (AST generation)
-- **`brush-builtins/`**: Implementation of shell builtins (e.g., echo, cd)
-- **`brush-interactive/`**: Interactive shell interfaces (readline, etc.)
-- **`brush-shell/`**: Main CLI application and entry point
+[docs/explanation/architecture.md](docs/explanation/architecture.md) is the definition of
+brush's architecture: its crates, how they depend on each other, how `brush-core` is
+structured, and the layering principles that decide which crate code belongs in (e.g.
+what `brush-core` owns vs. the interactive front end). Read it before adding a crate,
+moving code between crates, or changing a public API's shape, and keep it up to date when
+the architecture changes.
 
 ### Key Files & Entry Points
 
@@ -26,14 +36,14 @@ The brush project is organized into several key crates:
 
 - Shell instances are created via `Shell::builder()`
 - The project uses builder patterns for type-safe configuration
-- We try to keep platform-specific code in `brush-core` under the `sys` module
+- Platform-specific code in `brush-core` MUST live under the `sys` module
 - Follows Rust 2024 edition standards
 
 ### Module Dependencies
 
 ```text
-brush-shell → brush-interactive → brush-core → brush-parser
-            ↘ brush-builtins ↗
+brush-shell → brush-interactive ─────────────────────────→ brush-core → brush-parser
+            ↘ brush-builtins → brush-winnow-args-adapter ↗
 ```
 
 ## 2. Testing Strategy
@@ -105,7 +115,7 @@ cargo xtask ci full
 - **Compatibility tests**: `cargo test --test brush-compat-tests`
 - **Linting**: `cargo clippy`
 - **Formatting**: `cargo fmt --check`
-- **Pre-commit hooks** (spelling, links, workflows, dependency audit): `cargo xtask check hooks` (needs `prek`)
+- **Pre-commit hooks** (spelling, links, workflows, dependency audit, structural lints): `cargo xtask check hooks` (needs `prek`)
 - **Full test suite**: `cargo test --workspace`
 
 **When tests fail:**
@@ -182,6 +192,13 @@ cargo test --test brush-compat-tests -- '<name of test case>'
 
 - New optional fields are fine to add as long as the struct implements the Default trait and as long as the defaulted value is a sensible one
 
+**`#[non_exhaustive]` in `brush-parser`:**
+
+- Its error enums are `#[non_exhaustive]`, so a new error variant isn't a breaking change.
+- Its AST types (the `ast` and `word` modules) stay exhaustive, struct-like variants included (e.g.
+  `word::BraceExpressionMember::NumberSequence`). Code that walks the AST should get a compile error for
+  new syntax or a new field, not quietly fall into a `_` arm.
+
 ### Dependency Impact
 
 When changing public APIs in `brush-core` (see section 3 for breaking change policy):
@@ -233,8 +250,9 @@ cargo xtask ci full
 cargo xtask check fmt      # Format check
 cargo xtask check lint     # Clippy
 cargo xtask check build    # Compilation check
+cargo xtask check crates   # Crate structure (e.g. LICENSE symlinks)
 cargo xtask check schemas  # Schema drift check
-cargo xtask check hooks  # prek hooks: file hygiene, typos, zizmor, lychee, cargo-deny
+cargo xtask check hooks  # prek hooks: file hygiene, typos, zizmor, lychee, cargo-deny, ast-grep
 cargo xtask check hooks deps  # One hook, by id or alias
 
 # Tests
@@ -265,7 +283,7 @@ cargo xtask analyze bench  # Run benchmarks
 
 **Outer loop validation:**
 
-- `cargo xtask check hooks` should pass (file hygiene, typos, zizmor, lychee, cargo-deny) - not for frequent use during development; `cargo xtask ci full --no-hooks` skips it when `prek` is unavailable
+- `cargo xtask check hooks` should pass (file hygiene, typos, zizmor, lychee, cargo-deny, ast-grep) - not for frequent use during development; `cargo xtask ci full --no-hooks` skips it when `prek` is unavailable
 
 ## 6. Performance & Error Handling Patterns
 

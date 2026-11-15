@@ -10,6 +10,10 @@
 
 **BEFORE making any changes, read `/AGENTS.md`.** It contains detailed architecture patterns, testing workflows, and development guidelines specific to this project. The information below supplements (not replaces) AGENTS.md.
 
+Before investigating or implementing, also read the canonical
+[independent-implementation and provenance policy](../CONTRIBUTING.md#independent-implementation-and-provenance)
+required by `AGENTS.md`. Apply it to delegated agents and their tools.
+
 ## Code Review Checklist
 
 When reviewing PRs, verify:
@@ -286,7 +290,7 @@ The project uses **extremely strict** linting (workspace-level in `Cargo.toml`):
 ## Cross-Platform Considerations
 
 - Primary targets: Linux (x86_64, aarch64), macOS (aarch64)
-- Secondary: Windows (x86_64), WASM (wasm32-unknown-unknown, wasm32-wasip2)
+- Secondary: Windows (x86_64), WASM (wasm32-unknown-unknown, wasm32-wasip3)
 - Platform-specific code goes in `brush-core/src/sys/` modules
 - Use `cfg(unix)`, `cfg(windows)`, `cfg(target_family = "wasm")` appropriately
 - See `.cargo/config.toml` for target-specific configurations
