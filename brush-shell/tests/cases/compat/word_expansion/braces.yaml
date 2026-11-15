@@ -370,6 +370,21 @@ cases:
       arr=({a,b}c)
       echo "${#arr[@]}"
 
+  - name: "Expansion with curly braces does not depend on IFS"
+    stdin: |
+      IFS=
+      printf '<%s>' {A..C}
+      echo
+      printf '<%s>' {1,2}
+      echo
+      printf '<%s>' {a,}
+      echo
+      IFS=:
+      printf '<%s>' {A..C}
+      echo
+      printf '<%s>' x{1..3}y
+      echo
+
   - name: "A parameter expansion with braces inside a brace expression"
     known_failure: true # TODO(expansion): the `}` of `${u:-{1..2}}` is taken as the brace expression's; bash matches the parameter expansion's braces first
     stdin: |
