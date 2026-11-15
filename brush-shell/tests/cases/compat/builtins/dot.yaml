@@ -115,6 +115,29 @@ cases:
       source script.sh
       echo "After source"
 
+  - name: "Source with a parse error returns 2 without exiting the caller"
+    ignore_stderr: true
+    test_files:
+      - path: "bad.sh"
+        contents: |
+          :
+          echo "unterminated
+    stdin: |
+      source ./bad.sh
+      echo "Result: $?"
+      echo "After source"
+
+  - name: "Source with a parse error on the left of ||"
+    ignore_stderr: true
+    test_files:
+      - path: "bad.sh"
+        contents: |
+          :
+          echo "unterminated
+    stdin: |
+      source ./bad.sh || echo "Caught: $?"
+      echo "After source"
+
   - name: "Source with break in caller's loop"
     test_files:
       - path: "script.sh"
